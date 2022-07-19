@@ -1,4 +1,4 @@
 #![allow(dead_code)]
 mod watchdog;
 
-pub use watchdog::Watchdog;
+pub use crate::watchdog::Watchdog;
