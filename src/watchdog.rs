@@ -49,22 +49,26 @@ impl Watchdog {
     }
 
     #[instrument]
-    async fn rearm(&self, delay: Duration) -> () {
+    pub async fn rearm(&self, delay: Duration) -> () {
         self.rearm_sender.send(delay).await.unwrap();
         event!(Level::TRACE, "rearmed");
     }
 
     #[instrument]
-    fn refresh(&self) {
+    pub fn refresh(&self) {
         self.notifier.notify_waiters();
         event!(Level::TRACE, "refreshed");
     }
 
     #[instrument]
-    async fn disarm(&self) {
+    pub async fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
         self.notifier.notify_waiters();
         event!(Level::TRACE, "disarmed");
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
     }
 
     fn launch_core_task(
