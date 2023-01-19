@@ -1,120 +1,130 @@
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    fmt::Debug,
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
-use tokio::{
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Notify,
-    },
-    time::timeout,
-};
-use tracing::{event, instrument, span, Level};
+use chrono::Utc;
+use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+
+use crate::error::Error;
 
 #[derive(Debug, Clone)]
 pub struct Watchdog {
-    rearm_sender: Sender<Duration>,
-    armed: Arc<AtomicBool>,
-    notifier: Arc<Notify>,
+    inner: Arc<Mutex<WatchdogInner>>,
 }
 
 impl Watchdog {
-    pub fn new<T>(callback: T) -> Watchdog
-    where
-        T: FnMut() -> () + Send + 'static,
-    {
-        let (rearm_sender, rearm_receiver) = channel::<Duration>(1);
-        let (timeout_sender, timeout_receiver) = channel::<()>(1);
-        let armed = Arc::new(AtomicBool::new(false));
-        let notifier = Arc::new(Notify::new());
+    pub fn new() -> Self {
+        let inner = WatchdogInner {
+            timer_jh: None,
+            callback_exec_jh: None,
+            refresh_notifier: Arc::new(Notify::new()),
+            trigger_notifier: Arc::new(Notify::new()),
+        };
 
-        Watchdog::launch_core_task(
-            rearm_receiver,
-            armed.clone(),
-            notifier.clone(),
-            timeout_sender,
-        );
-
-        Watchdog::launch_closure_execution_task(callback, timeout_receiver);
-
-        Watchdog {
-            rearm_sender,
-            armed,
-            notifier,
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
         }
     }
 
-    #[instrument]
-    pub async fn rearm(&self, delay: Duration) -> () {
-        self.rearm_sender.send(delay).await.unwrap();
-        event!(Level::TRACE, "rearmed");
+    /// Register the callback that will be called if the watchdog trigger
+    ///
+    pub fn register_callback(&self, callback: impl FnMut(i64) -> () + Send + 'static) -> () {
+        let mut inner_guard = self.lock_inner();
+        let exec_jh = WatchdogInner::launch_callback_executor_task(
+            inner_guard.trigger_notifier.clone(),
+            Box::new(callback),
+        );
+        inner_guard.callback_exec_jh.replace(exec_jh);
     }
 
-    #[instrument]
-    pub fn refresh(&self) {
-        self.notifier.notify_waiters();
-        event!(Level::TRACE, "refreshed");
+    /// Rearm the watchdog
+    ///
+    pub fn rearm(&self, delay: Duration) -> Result<(), Error> {
+        let mut inner_guard = self.lock_inner();
+        if !inner_guard.has_timer() {
+            let jh = inner_guard.launch_timer(delay);
+            let _old_jh = inner_guard.timer_jh.replace(jh);
+            return Ok(());
+        }
+        return Err(Error::NoTimerStarted);
     }
 
-    #[instrument]
-    pub async fn disarm(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-        self.notifier.notify_waiters();
-        event!(Level::TRACE, "disarmed");
+    /// Disarm the watchdog
+    ///
+    pub fn disarm(&self) -> Result<(), Error> {
+        let mut inner_guard = self.lock_inner();
+        if inner_guard.has_timer() {
+            let _jh = inner_guard.timer_jh.take();
+            return Ok(());
+        }
+        return Err(Error::NoTimerStarted);
     }
 
-    pub fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::SeqCst)
+    /// Refresh the watchdog, resetting it's internal counter
+    ///
+    pub fn refresh(&self) -> Result<(), Error> {
+        let inner_guard = self.lock_inner();
+        if inner_guard.has_timer() {
+            inner_guard.refresh_notifier.notify_waiters();
+            return Ok(());
+        }
+        return Err(Error::NoTimerStarted);
     }
 
-    fn launch_core_task(
-        mut rearm_receiver: Receiver<Duration>,
-        armed: Arc<AtomicBool>,
-        notifier: Arc<Notify>,
-        timeout_sender: Sender<()>,
-    ) {
+    fn lock_inner(&self) -> MutexGuard<WatchdogInner> {
+        self.inner.lock().expect("WatchdogInner mutex lock failed")
+    }
+}
+
+#[derive()]
+pub struct WatchdogInner {
+    timer_jh: Option<JoinHandle<()>>,
+    callback_exec_jh: Option<JoinHandle<()>>,
+    refresh_notifier: Arc<Notify>,
+    trigger_notifier: Arc<Notify>,
+}
+
+impl WatchdogInner {
+    pub(crate) fn has_timer(&self) -> bool {
+        self.timer_jh.is_some()
+    }
+
+    pub(crate) fn launch_timer(&self, delay: Duration) -> JoinHandle<()> {
+        let refresh_notifier = self.refresh_notifier.clone();
+        let trigger_notifier = self.trigger_notifier.clone();
         tokio::spawn(async move {
-            let _span = span!(Level::TRACE, "wdg_core_task");
-            let mut delay: Duration = Duration::from_millis(100);
             loop {
-                if !armed.load(Ordering::SeqCst) {
-                    event!(Level::TRACE, "arming...");
-                    if let Some(new_delay) = rearm_receiver.recv().await {
-                        delay = new_delay;
-                        armed.store(true, Ordering::SeqCst);
-                        event!(Level::TRACE, "armed");
-                    } else {
-                        break;
-                    }
-                }
-                if let Err(_elapsed) = timeout(delay, notifier.notified()).await {
-                    event!(Level::TRACE, "timeout occured");
-                    if let Err(_send_error) = timeout_sender.send(()).await {
-                        break;
-                    }
+                if let Err(_) = timeout(delay, refresh_notifier.notified()).await {
+                    trigger_notifier.notify_waiters();
+                    break;
                 }
             }
-            event!(Level::TRACE, "Exit");
-        });
+        })
     }
 
-    fn launch_closure_execution_task<T>(mut callback: T, mut receiver: Receiver<()>)
-    where
-        T: FnMut() -> () + Send + 'static,
-    {
+    pub(crate) fn launch_callback_executor_task(
+        trigger_notifier: Arc<Notify>,
+        mut callback: Box<dyn FnMut(i64) -> () + Send + 'static>,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let _span = span!(Level::TRACE, "wdg_exec_task");
-            while let Some(_) = receiver.recv().await {
-                event!(Level::TRACE, "callback execution...");
-                callback();
-                event!(Level::TRACE, "callback executed");
+            loop {
+                trigger_notifier.notified().await;
+                let now = Utc::now().timestamp();
+                callback(now);
             }
-            event!(Level::TRACE, "Exit");
-        });
+        })
+    }
+}
+
+impl Debug for WatchdogInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchdogInner")
+            .field("timer_jh", &self.timer_jh)
+            .field("refresh_notifier", &self.refresh_notifier)
+            .field("trigger_notifier", &self.trigger_notifier)
+            .finish()
     }
 }
 
@@ -129,72 +139,86 @@ mod watchdog_tests {
 
     use super::Watchdog;
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct AssertStruct {
-        pub is_triggered: bool,
+        pub trigger: Arc<Mutex<Option<i64>>>,
     }
 
     impl AssertStruct {
-        pub fn trigger(&mut self) -> () {
-            self.is_triggered = true;
+        pub fn trigger(&self, time: i64) -> () {
+            self.trigger.lock().unwrap().replace(time);
+        }
+
+        pub fn is_triggered(&self) -> bool {
+            self.trigger.lock().unwrap().is_some()
         }
     }
 
     #[tokio::test]
-    async fn without_timeout() {
+    async fn no_timeout_no_refresh() {
         let (asrt, wdg) = prepare();
 
-        wdg.rearm(Duration::from_millis(100)).await;
+        wdg.rearm(Duration::from_millis(200)).unwrap();
 
-        for _ in 0..5 {
-            wdg.refresh();
-        }
-
-        drop(wdg);
-
-        assert!(!asrt.lock().unwrap().is_triggered);
+        assert!(!asrt.is_triggered());
     }
 
     #[tokio::test]
-    async fn with_timeout() {
+    async fn no_timeout_with_refresh() {
         let (asrt, wdg) = prepare();
 
-        wdg.rearm(Duration::from_millis(100)).await;
+        // arming the watchdog
+        wdg.rearm(Duration::from_millis(200)).unwrap();
 
-        sleep(Duration::from_millis(110)).await;
+        // waiting 150 micros, then in 50 micros the watchdog should trigger
+        sleep(Duration::from_millis(150)).await;
 
-        drop(wdg);
+        // before it trigger, it's refreshed, so it's resetted to 200 micros
+        wdg.refresh().unwrap();
 
-        assert!(asrt.lock().unwrap().is_triggered);
+        // waiting again 150 micro to prove that the initial 200 micros (timer started at the 'rearm' call) are passed
+        sleep(Duration::from_millis(150)).await;
+
+        // because we have refresh the watchdog before the due time, it didn't triggered
+        assert!(!asrt.is_triggered());
     }
 
     #[tokio::test]
-    async fn without_timeout_parallel() {
+    async fn with_timeout_no_refresh() {
         let (asrt, wdg) = prepare();
 
-        wdg.rearm(Duration::from_millis(100)).await;
+        wdg.rearm(Duration::from_millis(200)).unwrap();
 
-        let wdg_clone = wdg.clone();
-        tokio::spawn(async move {
-            for _ in 0..5 {
-                wdg_clone.refresh();
-            }
-        });
+        sleep(Duration::from_millis(250)).await;
 
-        drop(wdg);
-
-        assert!(!asrt.lock().unwrap().is_triggered);
+        assert!(asrt.is_triggered());
     }
 
-    fn prepare() -> (Arc<Mutex<AssertStruct>>, Watchdog) {
-        let asrt = Arc::new(Mutex::new(AssertStruct::default()));
+    #[tokio::test]
+    async fn with_timeout_with_refresh() {
+        let (asrt, wdg) = prepare();
 
-        let asrt_clone = asrt.clone();
-        let wdg = Watchdog::new(move || {
-            let mut guard = asrt_clone.lock().unwrap();
-            guard.is_triggered = true;
+        wdg.rearm(Duration::from_millis(200)).unwrap();
+
+        sleep(Duration::from_millis(150)).await;
+
+        assert!(!asrt.is_triggered());
+
+        wdg.refresh().unwrap();
+
+        sleep(Duration::from_millis(250)).await;
+
+        assert!(asrt.is_triggered());
+    }
+
+    fn prepare() -> (AssertStruct, Watchdog) {
+        let _asrt = AssertStruct::default();
+        let wdg = Watchdog::new();
+
+        let asrt = _asrt.clone();
+        wdg.register_callback(move |now| {
+            asrt.trigger(now);
         });
-
-        (asrt, wdg)
+        (_asrt, wdg)
     }
 }
