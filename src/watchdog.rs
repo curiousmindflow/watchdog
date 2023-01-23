@@ -6,6 +6,7 @@ use std::{
 
 use chrono::Utc;
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+use tracing::{event, info_span, instrument, Instrument, Level};
 
 use crate::error::Error;
 
@@ -15,6 +16,7 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
+    #[instrument]
     pub fn new() -> Self {
         let inner = WatchdogInner {
             timer_jh: None,
@@ -30,6 +32,7 @@ impl Watchdog {
 
     /// Register the callback that will be called if the watchdog trigger
     ///
+    #[instrument(skip_all)]
     pub fn register_callback(&self, callback: impl FnMut(i64) -> () + Send + 'static) -> () {
         let mut inner_guard = self.lock_inner();
         let exec_jh = WatchdogInner::launch_callback_executor_task(
@@ -41,6 +44,7 @@ impl Watchdog {
 
     /// Rearm the watchdog
     ///
+    #[instrument(skip_all)]
     pub fn rearm(&self, delay: Duration) -> Result<(), Error> {
         let mut inner_guard = self.lock_inner();
         if !inner_guard.has_timer() {
@@ -53,6 +57,7 @@ impl Watchdog {
 
     /// Disarm the watchdog
     ///
+    #[instrument(skip_all)]
     pub fn disarm(&self) -> Result<(), Error> {
         let mut inner_guard = self.lock_inner();
         if inner_guard.has_timer() {
@@ -64,6 +69,7 @@ impl Watchdog {
 
     /// Refresh the watchdog, resetting it's internal counter
     ///
+    #[instrument(skip_all)]
     pub fn refresh(&self) -> Result<(), Error> {
         let inner_guard = self.lock_inner();
         if inner_guard.has_timer() {
@@ -73,6 +79,7 @@ impl Watchdog {
         return Err(Error::NoTimerStarted);
     }
 
+    #[instrument(skip_all)]
     fn lock_inner(&self) -> MutexGuard<WatchdogInner> {
         self.inner.lock().expect("WatchdogInner mutex lock failed")
     }
@@ -87,34 +94,44 @@ pub struct WatchdogInner {
 }
 
 impl WatchdogInner {
+    #[instrument(skip_all)]
     pub(crate) fn has_timer(&self) -> bool {
         self.timer_jh.is_some()
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn launch_timer(&self, delay: Duration) -> JoinHandle<()> {
         let refresh_notifier = self.refresh_notifier.clone();
         let trigger_notifier = self.trigger_notifier.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(_) = timeout(delay, refresh_notifier.notified()).await {
-                    trigger_notifier.notify_waiters();
-                    break;
+        tokio::spawn(
+            async move {
+                loop {
+                    if let Err(_) = timeout(delay, refresh_notifier.notified()).await {
+                        trigger_notifier.notify_waiters();
+                        break;
+                    }
                 }
             }
-        })
+            .instrument(info_span!("timer")),
+        )
     }
 
+    #[instrument(skip_all)]
     pub(crate) fn launch_callback_executor_task(
         trigger_notifier: Arc<Notify>,
         mut callback: Box<dyn FnMut(i64) -> () + Send + 'static>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                trigger_notifier.notified().await;
-                let now = Utc::now().timestamp();
-                callback(now);
+        tokio::spawn(
+            async move {
+                loop {
+                    trigger_notifier.notified().await;
+                    let now = Utc::now().timestamp();
+                    callback(now);
+                    event!(Level::TRACE, "watchdog triggered callback")
+                }
             }
-        })
+            .instrument(info_span!("callback_executor_task")),
+        )
     }
 }
 
@@ -159,7 +176,9 @@ mod watchdog_tests {
         let (asrt, wdg) = prepare();
 
         wdg.rearm(Duration::from_millis(200)).unwrap();
+        // wdg.rearm(Duration::from_secs(5)).unwrap();
 
+        // sleep(Duration::from_secs(200)).await;
         assert!(!asrt.is_triggered());
     }
 
