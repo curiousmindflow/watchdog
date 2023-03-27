@@ -33,7 +33,7 @@ impl Watchdog {
     /// Register the callback that will be called if the watchdog trigger
     ///
     #[instrument(skip_all)]
-    pub fn register_callback(&self, callback: impl FnMut(i64) -> () + Send + 'static) -> () {
+    pub fn register_callback(&self, callback: impl FnMut(i64) + Send + 'static) -> () {
         let mut inner_guard = self.lock_inner();
         let exec_jh = WatchdogInner::launch_callback_executor_task(
             inner_guard.trigger_notifier.clone(),
@@ -50,9 +50,10 @@ impl Watchdog {
         if !inner_guard.has_timer() {
             let jh = inner_guard.launch_timer(delay);
             let _old_jh = inner_guard.timer_jh.replace(jh);
-            return Ok(());
+            Ok(())
+        } else {
+            Err(Error::NoTimerStarted)
         }
-        return Err(Error::NoTimerStarted);
     }
 
     /// Disarm the watchdog
@@ -62,9 +63,10 @@ impl Watchdog {
         let mut inner_guard = self.lock_inner();
         if inner_guard.has_timer() {
             let _jh = inner_guard.timer_jh.take();
-            return Ok(());
+            Ok(())
+        } else {
+            Err(Error::NoTimerStarted)
         }
-        return Err(Error::NoTimerStarted);
     }
 
     /// Refresh the watchdog, resetting it's internal counter
@@ -74,9 +76,10 @@ impl Watchdog {
         let inner_guard = self.lock_inner();
         if inner_guard.has_timer() {
             inner_guard.refresh_notifier.notify_waiters();
-            return Ok(());
+            Ok(())
+        } else {
+            Err(Error::NoTimerStarted)
         }
-        return Err(Error::NoTimerStarted);
     }
 
     #[instrument(skip_all)]
@@ -106,7 +109,7 @@ impl WatchdogInner {
         tokio::spawn(
             async move {
                 loop {
-                    if let Err(_) = timeout(delay, refresh_notifier.notified()).await {
+                    if (timeout(delay, refresh_notifier.notified()).await).is_err() {
                         trigger_notifier.notify_waiters();
                         break;
                     }
@@ -119,7 +122,7 @@ impl WatchdogInner {
     #[instrument(skip_all)]
     pub(crate) fn launch_callback_executor_task(
         trigger_notifier: Arc<Notify>,
-        mut callback: Box<dyn FnMut(i64) -> () + Send + 'static>,
+        mut callback: Box<dyn FnMut(i64) + Send + 'static>,
     ) -> JoinHandle<()> {
         tokio::spawn(
             async move {
@@ -162,7 +165,7 @@ mod watchdog_tests {
     }
 
     impl AssertStruct {
-        pub fn trigger(&self, time: i64) -> () {
+        pub fn trigger(&self, time: i64) {
             self.trigger.lock().unwrap().replace(time);
         }
 
