@@ -1,11 +1,12 @@
-use std::{
-    fmt::Debug,
-    sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
-};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use chrono::Utc;
-use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, MutexGuard, Notify},
+    task::JoinHandle,
+    time::timeout,
+};
 use tracing::{event, info_span, instrument, Instrument, Level};
 
 use crate::error::Error;
@@ -33,8 +34,8 @@ impl Watchdog {
     /// Register the callback that will be called if the watchdog trigger
     ///
     #[instrument(skip_all)]
-    pub fn register_callback(&self, callback: impl FnMut(i64) + Send + 'static) -> () {
-        let mut inner_guard = self.lock_inner();
+    pub async fn register_callback(&self, callback: impl FnMut(i64) + Send + 'static) -> () {
+        let mut inner_guard = self.lock_inner().await;
         let exec_jh = WatchdogInner::launch_callback_executor_task(
             inner_guard.trigger_notifier.clone(),
             Box::new(callback),
@@ -45,8 +46,8 @@ impl Watchdog {
     /// Rearm the watchdog
     ///
     #[instrument(skip_all)]
-    pub fn rearm(&self, delay: Duration) -> Result<(), Error> {
-        let mut inner_guard = self.lock_inner();
+    pub async fn rearm(&self, delay: Duration) -> Result<(), Error> {
+        let mut inner_guard = self.lock_inner().await;
         if !inner_guard.has_timer() {
             let jh = inner_guard.launch_timer(delay);
             let _old_jh = inner_guard.timer_jh.replace(jh);
@@ -59,8 +60,8 @@ impl Watchdog {
     /// Disarm the watchdog
     ///
     #[instrument(skip_all)]
-    pub fn disarm(&self) -> Result<(), Error> {
-        let mut inner_guard = self.lock_inner();
+    pub async fn disarm(&self) -> Result<(), Error> {
+        let mut inner_guard = self.lock_inner().await;
         if inner_guard.has_timer() {
             let _jh = inner_guard.timer_jh.take();
             Ok(())
@@ -72,8 +73,8 @@ impl Watchdog {
     /// Refresh the watchdog, resetting it's internal counter
     ///
     #[instrument(skip_all)]
-    pub fn refresh(&self) -> Result<(), Error> {
-        let inner_guard = self.lock_inner();
+    pub async fn refresh(&self) -> Result<(), Error> {
+        let inner_guard = self.lock_inner().await;
         if inner_guard.has_timer() {
             inner_guard.refresh_notifier.notify_waiters();
             Ok(())
@@ -83,8 +84,8 @@ impl Watchdog {
     }
 
     #[instrument(skip_all)]
-    fn lock_inner(&self) -> MutexGuard<WatchdogInner> {
-        self.inner.lock().expect("WatchdogInner mutex lock failed")
+    async fn lock_inner(&self) -> MutexGuard<WatchdogInner> {
+        self.inner.lock().await
     }
 }
 
@@ -106,6 +107,7 @@ impl WatchdogInner {
     pub(crate) fn launch_timer(&self, delay: Duration) -> JoinHandle<()> {
         let refresh_notifier = self.refresh_notifier.clone();
         let trigger_notifier = self.trigger_notifier.clone();
+        let _handle = Handle::current();
         tokio::spawn(
             async move {
                 loop {
@@ -176,9 +178,9 @@ mod watchdog_tests {
 
     #[tokio::test]
     async fn no_timeout_no_refresh() {
-        let (asrt, wdg) = prepare();
+        let (asrt, wdg) = prepare().await;
 
-        wdg.rearm(Duration::from_millis(200)).unwrap();
+        wdg.rearm(Duration::from_millis(200)).await.unwrap();
         // wdg.rearm(Duration::from_secs(5)).unwrap();
 
         // sleep(Duration::from_secs(200)).await;
@@ -187,16 +189,16 @@ mod watchdog_tests {
 
     #[tokio::test]
     async fn no_timeout_with_refresh() {
-        let (asrt, wdg) = prepare();
+        let (asrt, wdg) = prepare().await;
 
         // arming the watchdog
-        wdg.rearm(Duration::from_millis(200)).unwrap();
+        wdg.rearm(Duration::from_millis(200)).await.unwrap();
 
         // waiting 150 micros, then in 50 micros the watchdog should trigger
         sleep(Duration::from_millis(150)).await;
 
         // before it trigger, it's refreshed, so it's resetted to 200 micros
-        wdg.refresh().unwrap();
+        wdg.refresh().await.unwrap();
 
         // waiting again 150 micro to prove that the initial 200 micros (timer started at the 'rearm' call) are passed
         sleep(Duration::from_millis(150)).await;
@@ -207,9 +209,9 @@ mod watchdog_tests {
 
     #[tokio::test]
     async fn with_timeout_no_refresh() {
-        let (asrt, wdg) = prepare();
+        let (asrt, wdg) = prepare().await;
 
-        wdg.rearm(Duration::from_millis(200)).unwrap();
+        wdg.rearm(Duration::from_millis(200)).await.unwrap();
 
         sleep(Duration::from_millis(250)).await;
 
@@ -218,29 +220,30 @@ mod watchdog_tests {
 
     #[tokio::test]
     async fn with_timeout_with_refresh() {
-        let (asrt, wdg) = prepare();
+        let (asrt, wdg) = prepare().await;
 
-        wdg.rearm(Duration::from_millis(200)).unwrap();
+        wdg.rearm(Duration::from_millis(200)).await.unwrap();
 
         sleep(Duration::from_millis(150)).await;
 
         assert!(!asrt.is_triggered());
 
-        wdg.refresh().unwrap();
+        wdg.refresh().await.unwrap();
 
         sleep(Duration::from_millis(250)).await;
 
         assert!(asrt.is_triggered());
     }
 
-    fn prepare() -> (AssertStruct, Watchdog) {
+    async fn prepare() -> (AssertStruct, Watchdog) {
         let _asrt = AssertStruct::default();
         let wdg = Watchdog::new();
 
         let asrt = _asrt.clone();
         wdg.register_callback(move |now| {
             asrt.trigger(now);
-        });
+        })
+        .await;
         (_asrt, wdg)
     }
 }
